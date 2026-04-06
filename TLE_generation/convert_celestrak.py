@@ -6,24 +6,30 @@
 # ]
 # ///
 
-"""Read a CCSDS OMM XML file, propagate it with Orekit, and write a fitted TLE.
+"""Read a CCSDS OMM or OEM XML file, propagate it with Orekit, and write a fitted TLE.
 
-Workflow:
-1. Parse the input OMM XML with Orekit.
+OMM workflow:
+1. Parse the OMM XML with Orekit.
 2. Let Orekit create the corresponding initial TLE and SGP4 propagator.
-3. Build a bounded ephemeris from the OMM epoch to +3 days with 20 minute sampling.
-4. Fit one new TLE to those sampled states, while keeping the fitted TLE epoch equal
-   to the original OMM epoch.
+3. Build a bounded ephemeris from the OMM epoch to +3 days with 20-minute sampling.
+4. Fit one new TLE to those sampled states, keeping the TLE epoch equal to the OMM epoch.
 5. Write the fitted TLE to a sibling `.TLE` file.
 
+OEM workflow:
+1. Parse the OEM XML with Orekit — it already contains a tabulated ephemeris.
+2. Use the OEM's built-in bounded propagator directly (no SGP4 step needed).
+3. Fit one new TLE to states sampled from the OEM's full time range.
+4. Write the fitted TLE to a sibling `.TLE` file.
+
 Orekit APIs used here:
-- `ParserBuilder().buildNdmParser().parseMessage(...)` for CCSDS OMM parsing
-- `Omm.generateTLE()` for the initial TLE
-- `TLEPropagator.selectExtrapolator(...)` for the SGP4 propagator
-- `getEphemerisGenerator()` for the bounded ephemeris
+- `ParserBuilder().buildNdmParser().parseMessage(...)` for CCSDS OMM/OEM parsing
+- `Omm.generateTLE()` for the initial TLE (OMM path only)
+- `TLEPropagator.selectExtrapolator(...)` for the SGP4 propagator (OMM path only)
+- `getEphemerisGenerator()` for the bounded ephemeris (OMM path only)
+- `EphemerisFile.SatelliteEphemeris.getPropagator()` for the OEM ephemeris propagator
 - `TLEPropagatorBuilder` + `FiniteDifferencePropagatorConverter` for fitting a
   new TLE from sampled position states
-  
+
 This code was to a large degree written by AI (Codex + Claude) directed by Petrus Hyvönen 2026
 """
 
@@ -55,6 +61,8 @@ from org.orekit.propagation.conversion import (
     FiniteDifferencePropagatorConverter,
     TLEPropagatorBuilder,
 )
+from org.orekit.time import TimeScalesFactory
+from org.orekit.utils import Constants
 
 STEP_SECONDS = 20 * 60
 DURATION_SECONDS = 3 * 24 * 60 * 60
@@ -63,12 +71,19 @@ FIT_POSITION_ONLY = True
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read a CelesTrak OMM XML file and create an Orekit propagator."
+        description="Read a CelesTrak OMM or OEM XML file and fit a TLE to it."
     )
     parser.add_argument(
         "orbitdescription",
         type=Path,
-        help="Path to the OMM XML file.",
+        help="Path to the OMM or OEM XML file.",
+    )
+    parser.add_argument(
+        "--type",
+        choices=["omm", "oem"],
+        required=True,
+        help="Type of the input file: 'omm' for an Orbit Mean-elements Message, "
+             "'oem' for an Orbit Ephemeris Message.",
     )
     return parser.parse_args()
 
@@ -115,18 +130,22 @@ def normalize_omm_xml(omm_xml: str) -> str:
     return normalized
 
 
+def _make_data_source(xml_content: str, name: str) -> DataSource:
+    """Wrap an XML string in the DataSource Orekit expects."""
+    reader_opener = jpype.JProxy(
+        DataSource.ReaderOpener,
+        dict(openOnce=lambda: StringReader(xml_content)),
+    )
+    return DataSource(name, reader_opener)
+
+
 def create_propagator_from_omm_xml(omm_xml: str):
-    """Parse one OMM message and return `(omm, original_tle, propagator)`."""
+    """Parse one OMM message and return ``(omm, original_tle, propagator)``."""
     omm_xml = normalize_omm_xml(omm_xml)
 
     # `DataSource.ReaderOpener` is Orekit's text-input hook. JPype's `JProxy`
     # lets us implement that small Java interface directly from Python.
-    reader_opener = jpype.JProxy(
-        DataSource.ReaderOpener,
-        dict(openOnce=lambda: StringReader(omm_xml)),
-    )
-    data_source = DataSource("omm.xml", reader_opener)
-    ndm_message = ParserBuilder().buildNdmParser().parseMessage(data_source)
+    ndm_message = ParserBuilder().buildNdmParser().parseMessage(_make_data_source(omm_xml, "omm.xml"))
     omm_messages = list(ndm_message.getConstituents())
     if len(omm_messages) != 1:
         raise ValueError(f"Expected exactly one OMM constituent, got {len(omm_messages)}")
@@ -135,6 +154,51 @@ def create_propagator_from_omm_xml(omm_xml: str):
     tle = omm.generateTLE()
     propagator = TLEPropagator.selectExtrapolator(tle)
     return omm, tle, propagator
+
+
+def normalize_oem_xml(oem_xml: str) -> str:
+    """Remove empty COMMENT elements that cause Orekit's parser to crash.
+
+    Some OEM providers (e.g. NASA JSC) emit blank ``<COMMENT></COMMENT>`` lines
+    as visual separators.  Orekit calls ``getContentAsNormalizedString()`` on
+    every COMMENT token and throws a NullPointerException when the content is
+    empty.  Stripping them before parsing is the safest fix.
+    """
+    return re.sub(r"<COMMENT>\s*</COMMENT>\s*\n?", "", oem_xml)
+
+
+def create_ephemeris_from_oem_xml(oem_xml: str):
+    """Parse one OEM message and return ``(object_name, object_id, ephemeris)``.
+
+    An OEM already contains a tabulated ephemeris, so the returned ``ephemeris``
+    is a ``BoundedPropagator`` that can be sampled directly — no SGP4 step needed.
+
+    ``withMu`` supplies Earth's gravitational parameter (µ), which the OEM format
+    does not carry but Orekit needs to build the interpolating propagator.
+    """
+    oem_xml = normalize_oem_xml(oem_xml)
+    ndm_message = (
+        ParserBuilder()
+        .withMu(Constants.WGS84_EARTH_MU)
+        .buildNdmParser()
+        .parseMessage(_make_data_source(oem_xml, "oem.xml"))
+    )
+    oem_messages = list(ndm_message.getConstituents())
+    if len(oem_messages) != 1:
+        raise ValueError(f"Expected exactly one OEM constituent, got {len(oem_messages)}")
+
+    oem = oem_messages[0]
+    satellites = oem.getSatellites()
+    sat_keys = list(satellites.keySet())
+    if len(sat_keys) != 1:
+        raise ValueError(f"Expected exactly one satellite in OEM, got {len(sat_keys)}")
+
+    segment_metadata = list(oem.getSegments())[0].getMetadata()
+    object_name = segment_metadata.getObjectName()
+    object_id = segment_metadata.getObjectID()
+
+    ephemeris = satellites.get(sat_keys[0]).getPropagator()
+    return object_name, object_id, ephemeris
 
 
 def build_bounded_ephemeris(propagator, start_date, end_date):
@@ -158,21 +222,45 @@ def collect_states(ephemeris, start_date, end_date, step_seconds: float):
     return states
 
 
-def build_reference_tle_from_state(state, source_tle):
+def build_reference_tle_from_state(state, source_tle=None):
     """Build Orekit's required TLE reference guess from one spacecraft state.
 
-    The orbital elements come from the state itself, while identification metadata
-    comes from the original TLE generated from the OMM.
+    The Keplerian orbital elements come from ``state``. Satellite identification
+    metadata is copied from ``source_tle`` when provided; placeholder values are
+    used otherwise (e.g. when fitting from an OEM that carries no NORAD number).
     """
     orbit = OrbitType.KEPLERIAN.convertType(state.getOrbit())
+
+    if source_tle is not None:
+        satellite_number = source_tle.getSatelliteNumber()
+        classification = source_tle.getClassification()
+        launch_year = source_tle.getLaunchYear()
+        launch_number = source_tle.getLaunchNumber()
+        launch_piece = source_tle.getLaunchPiece()
+        ephemeris_type = source_tle.getEphemerisType()
+        element_number = source_tle.getElementNumber()
+        revolution_number = source_tle.getRevolutionNumberAtEpoch()
+        utc = source_tle.getUtc()
+    else:
+        # OEM files carry no NORAD catalog number; use placeholder values.
+        satellite_number = 0
+        classification = "U"
+        launch_year = 0
+        launch_number = 0
+        launch_piece = "A"
+        ephemeris_type = 0
+        element_number = 0
+        revolution_number = 0
+        utc = TimeScalesFactory.getUTC()
+
     return TLE(
-        source_tle.getSatelliteNumber(),
-        source_tle.getClassification(),
-        source_tle.getLaunchYear(),
-        source_tle.getLaunchNumber(),
-        source_tle.getLaunchPiece(),
-        source_tle.getEphemerisType(),
-        source_tle.getElementNumber(),
+        satellite_number,
+        classification,
+        launch_year,
+        launch_number,
+        launch_piece,
+        ephemeris_type,
+        element_number,
         state.getDate(),
         orbit.getKeplerianMeanMotion(),
         0.0,
@@ -182,13 +270,13 @@ def build_reference_tle_from_state(state, source_tle):
         orbit.getPerigeeArgument(),
         orbit.getRightAscensionOfAscendingNode(),
         orbit.getMeanAnomaly(),
-        source_tle.getRevolutionNumberAtEpoch(),
+        revolution_number,
         0.0,
-        source_tle.getUtc(),
+        utc,
     )
 
 
-def fit_new_tle_from_ephemeris(ephemeris, start_date, end_date, step_seconds, source_tle):
+def fit_new_tle_from_ephemeris(ephemeris, start_date, end_date, step_seconds, source_tle=None):
     """Fit one new TLE to sampled ephemeris states.
 
     This follows Orekit's TLE fitting route:
@@ -196,8 +284,9 @@ def fit_new_tle_from_ephemeris(ephemeris, start_date, end_date, step_seconds, so
     - feed sampled states to `FiniteDifferencePropagatorConverter`
     - ask Orekit to fit using TLE dynamics
 
-    `useOnlyPosition=True` means the fitting is driven by position, which gives more clarity on the
-    RMS error (in meters).
+    ``useOnlyPosition=True`` means the fitting is driven by position, which gives
+    a meaningful RMS error in metres.  When ``source_tle`` is ``None`` (OEM path),
+    placeholder satellite identification metadata is used in the template TLE.
     """
     states = collect_states(ephemeris, start_date, end_date, step_seconds)
     reference_state = ephemeris.propagate(start_date)
@@ -225,32 +314,43 @@ def write_tle_file(path: Path, tle) -> None:
 
 def main() -> None:
     args = parse_args()
-    omm_xml = load_orbit_description(args.orbitdescription)
-    omm, tle, propagator = create_propagator_from_omm_xml(omm_xml)
-    epoch = omm.getData().getKeplerianElementsBlock().getEpoch()
-    end_date = epoch.shiftedBy(DURATION_SECONDS)
-    ephemeris = build_bounded_ephemeris(propagator, epoch, end_date)
+    xml_content = load_orbit_description(args.orbitdescription)
+    file_type = args.type
+
+    if file_type == "omm":
+        omm, source_tle, propagator = create_propagator_from_omm_xml(xml_content)
+        object_name = omm.getMetadata().getObjectName()
+        object_id = omm.getMetadata().getObjectID()
+        epoch = omm.getData().getKeplerianElementsBlock().getEpoch()
+        end_date = epoch.shiftedBy(DURATION_SECONDS)
+        ephemeris = build_bounded_ephemeris(propagator, epoch, end_date)
+    else:  # oem
+        object_name, object_id, ephemeris = create_ephemeris_from_oem_xml(xml_content)
+        source_tle = None
+        epoch = ephemeris.getMinDate()
+        end_date = ephemeris.getMaxDate()
+
     regenerated_tle, regenerated_tle_rms, sample_count = fit_new_tle_from_ephemeris(
-        ephemeris, epoch, end_date, STEP_SECONDS, tle
+        ephemeris, epoch, end_date, STEP_SECONDS, source_tle
     )
     output_path = tle_output_path(args.orbitdescription)
     write_tle_file(output_path, regenerated_tle)
 
-    print(f"Loaded OMM from {args.orbitdescription}")
-    print(f"Object: {omm.getMetadata().getObjectName()} ({omm.getMetadata().getObjectID()})")
+    print(f"Loaded {file_type.upper()} from {args.orbitdescription}")
+    print(f"Object: {object_name} ({object_id})")
     print(f"Epoch: {epoch}")
     print(f"Ephemeris start: {ephemeris.getMinDate()}")
     print(f"Ephemeris end: {ephemeris.getMaxDate()}")
     print(f"Step seconds: {STEP_SECONDS}")
     print(f"Samples: {sample_count}")
-    print(f"Original TLE line 1: {tle.getLine1()}")
-    print(f"Original TLE line 2: {tle.getLine2()}")
+    if source_tle is not None:
+        print(f"Original TLE line 1: {source_tle.getLine1()}")
+        print(f"Original TLE line 2: {source_tle.getLine2()}")
     print(f"Regenerated TLE epoch: {regenerated_tle.getDate()}")
     print(f"Regenerated TLE RMS: {regenerated_tle_rms:.3f} m")
     print(f"Regenerated TLE line 1: {regenerated_tle.getLine1()}")
     print(f"Regenerated TLE line 2: {regenerated_tle.getLine2()}")
     print(f"TLE file: {output_path}")
-    print(f"Propagator: {propagator.getClass().getName()}")
 
 
 if __name__ == "__main__":
