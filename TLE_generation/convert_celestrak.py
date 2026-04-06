@@ -29,6 +29,12 @@ Orekit APIs used here:
 - `EphemerisFile.SatelliteEphemeris.getPropagator()` for the OEM ephemeris propagator
 - `TLEPropagatorBuilder` + `FiniteDifferencePropagatorConverter` for fitting a
   new TLE from sampled position states
+  
+examples:
+    
+    uv run --no-project convert_celestrak.py --type oem ISS.OEM_J2K_EPH.xml  
+
+    uv run --no-project convert_celestrak.py --type omm ISS.XML
 
 This code was to a large degree written by AI (Codex + Claude) directed by Petrus Hyvönen 2026
 """
