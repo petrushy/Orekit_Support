@@ -85,6 +85,15 @@ def parse_args() -> argparse.Namespace:
         help="Type of the input file: 'omm' for an Orbit Mean-elements Message, "
              "'oem' for an Orbit Ephemeris Message.",
     )
+    parser.add_argument(
+        "--norad",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Override the NORAD catalog number written into the output TLE "
+             "(e.g. --norad 25544).  Required when using --type oem, which "
+             "carries no catalog number.",
+    )
     return parser.parse_args()
 
 
@@ -222,12 +231,13 @@ def collect_states(ephemeris, start_date, end_date, step_seconds: float):
     return states
 
 
-def build_reference_tle_from_state(state, source_tle=None):
+def build_reference_tle_from_state(state, source_tle=None, norad_id=None):
     """Build Orekit's required TLE reference guess from one spacecraft state.
 
     The Keplerian orbital elements come from ``state``. Satellite identification
     metadata is copied from ``source_tle`` when provided; placeholder values are
     used otherwise (e.g. when fitting from an OEM that carries no NORAD number).
+    If ``norad_id`` is given it overrides whatever ``source_tle`` carries.
     """
     orbit = OrbitType.KEPLERIAN.convertType(state.getOrbit())
 
@@ -253,6 +263,9 @@ def build_reference_tle_from_state(state, source_tle=None):
         revolution_number = 0
         utc = TimeScalesFactory.getUTC()
 
+    if norad_id is not None:
+        satellite_number = norad_id
+
     return TLE(
         satellite_number,
         classification,
@@ -276,7 +289,7 @@ def build_reference_tle_from_state(state, source_tle=None):
     )
 
 
-def fit_new_tle_from_ephemeris(ephemeris, start_date, end_date, step_seconds, source_tle=None):
+def fit_new_tle_from_ephemeris(ephemeris, start_date, end_date, step_seconds, source_tle=None, norad_id=None):
     """Fit one new TLE to sampled ephemeris states.
 
     This follows Orekit's TLE fitting route:
@@ -287,10 +300,11 @@ def fit_new_tle_from_ephemeris(ephemeris, start_date, end_date, step_seconds, so
     ``useOnlyPosition=True`` means the fitting is driven by position, which gives
     a meaningful RMS error in metres.  When ``source_tle`` is ``None`` (OEM path),
     placeholder satellite identification metadata is used in the template TLE.
+    ``norad_id`` overrides the catalog number in the output TLE when provided.
     """
     states = collect_states(ephemeris, start_date, end_date, step_seconds)
     reference_state = ephemeris.propagate(start_date)
-    template_tle = build_reference_tle_from_state(reference_state, source_tle)
+    template_tle = build_reference_tle_from_state(reference_state, source_tle, norad_id)
     generation_algorithm = LeastSquaresTleGenerationAlgorithm()
     builder = TLEPropagatorBuilder(
         template_tle,
@@ -331,7 +345,7 @@ def main() -> None:
         end_date = ephemeris.getMaxDate()
 
     regenerated_tle, regenerated_tle_rms, sample_count = fit_new_tle_from_ephemeris(
-        ephemeris, epoch, end_date, STEP_SECONDS, source_tle
+        ephemeris, epoch, end_date, STEP_SECONDS, source_tle, args.norad
     )
     output_path = tle_output_path(args.orbitdescription)
     write_tle_file(output_path, regenerated_tle)
