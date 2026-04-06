@@ -8,7 +8,7 @@ dependencies = [
     "ipython>=9.0.2",
     "jupyterlab-git>=0.51.4",
     "notebook>=7.4.3",
-    "orekit-jpype==13.1.2.2",
+    "orekit-jpype>=13.1.4.0",
     "orekitdata",
 ]
 
