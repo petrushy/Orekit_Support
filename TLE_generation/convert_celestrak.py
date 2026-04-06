@@ -188,10 +188,19 @@ def create_ephemeris_from_oem_xml(oem_xml: str):
     An OEM already contains a tabulated ephemeris, so the returned ``ephemeris``
     is a ``BoundedPropagator`` that can be sampled directly — no SGP4 step needed.
 
-    ``withMu`` supplies Earth's gravitational parameter (µ), which the OEM format
-    does not carry but Orekit needs to build the interpolating propagator.
+    ``withMu`` supplies the gravitational parameter (µ) for the central body, which
+    the OEM format does not carry but Orekit needs to build the interpolating propagator.
+    Only Earth-centred OEMs are accepted, because TLEs are inherently Earth-specific.
     """
     oem_xml = normalize_oem_xml(oem_xml)
+
+    center_match = re.search(r"<CENTER_NAME>(.*?)</CENTER_NAME>", oem_xml, re.IGNORECASE)
+    center_name = center_match.group(1).strip().upper() if center_match else "UNKNOWN"
+    if center_name != "EARTH":
+        raise ValueError(
+            f"OEM central body is '{center_name}', but TLEs are only valid for Earth-orbiting objects."
+        )
+
     ndm_message = (
         ParserBuilder()
         .withMu(Constants.WGS84_EARTH_MU)
